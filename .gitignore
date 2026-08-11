@@ -1,0 +1,17 @@
+# This is a snap PACKAGING repo. Upstream Actual source is cloned in here so
+# snap-analyzer can scan it, but is never committed — snapcraft.yaml builds
+# from source: + source-tag.
+#
+# Strategy: ignore everything, then re-include only the packaging files.
+
+/*
+/.*
+
+!/.gitignore
+!/README.md
+!/snap/
+!/SNAP_PACKAGING.md
+!/SNAP-PROGRESS.md
+
+# Build artefacts stay ignored even though snap/ is re-included
+*.snap

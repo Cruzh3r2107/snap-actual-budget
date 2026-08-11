@@ -1,0 +1,221 @@
+name: vsingh-actual
+base: core26
+version: '26.8.0'
+summary: Self-hosted sync server for Actual Budget personal finance app
+description: |
+  Packages @actual-app/sync-server, the self-hosted synchronization backend
+  for Actual Budget (a local-first personal finance app). The server also
+  hosts the built @actual-app/web static frontend, so this single snap
+  provides both the API/sync backend and the web UI on one port. Built from
+  the actualbudget/actual upstream tree at tag v26.8.0.
+license: MIT
+grade: devel
+confinement: strict
+
+apps:
+  vsingh-actual:
+    command: bin/run-daemon
+    daemon: simple
+    plugs:
+      - network
+      - network-bind
+    environment:
+      NODE_ENV: production
+      ACTUAL_DATA_DIR: $SNAP_COMMON/data
+
+parts:
+  sync-server:
+    plugin: nil
+    # This packaging repo does not commit the upstream Actual source tree
+    # (see .gitignore) — a local checkout is scratch, not a build input.
+    # Source is fetched from upstream at a pinned tag so this repo is
+    # self-sufficient: `git clone && snapcraft` reproduces the snap on any
+    # machine, which matters because this snap is pinned by revision in a
+    # signed Ubuntu Core model assertion.
+    #
+    # An earlier revision of this file used `source: .` because github.com
+    # appeared unreachable from the build instance. That diagnosis was
+    # wrong: Docker's iptables FORWARD DROP policy was discarding ALL IPv4
+    # forwarded from the workshopbr0 bridge, while IPv6 still worked — so
+    # only IPv4-only hosts (github.com) failed, and hosts with AAAA records
+    # (nodejs.org, archive.ubuntu.com) appeared fine. Fixed by allowing the
+    # bridge through the DOCKER-USER chain. If IPv4 fetches start timing out
+    # again, check that before assuming a host is down.
+    source: https://github.com/actualbudget/actual.git
+    source-type: git
+    source-tag: v26.8.0
+    build-packages:
+      - build-essential
+      - python3
+      - pkg-config
+      - git
+      - ca-certificates
+      - curl
+      - xz-utils
+    stage-packages:
+      - ca-certificates
+    build-environment:
+      # Without this the yarn build:server step OOMs.
+      - NODE_OPTIONS: "--max_old_space_size=8192"
+    # plugin: nil gives us no lifecycle steps to build on top of (there is no
+    # `craftctl default` to call for "nil"), so override-build reproduces
+    # sync-server.Dockerfile's builder stage end-to-end.
+    override-build: |
+      set -eux
+
+      NODE_VERSION=22.18.0
+      NODE_DIST_DIR="${CRAFT_PART_BUILD}/node-dist"
+
+      # ---------------------------------------------------------------
+      # 1. Fetch the official Node.js linux-x64 tarball. The .nvmrc in
+      #    this tree pins v22.18.0 (root package.json engines.node is
+      #    >=22.18.0, sync-server.Dockerfile uses node:22-bookworm). Do
+      #    NOT depend on core26's archive nodejs (22.22.1) for the build
+      #    so this stays reproducible against the exact pinned version.
+      # ---------------------------------------------------------------
+      curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+        -o "${CRAFT_PART_BUILD}/node.tar.xz"
+      mkdir -p "${NODE_DIST_DIR}"
+      tar -xf "${CRAFT_PART_BUILD}/node.tar.xz" -C "${NODE_DIST_DIR}" --strip-components=1
+      export PATH="${NODE_DIST_DIR}/bin:${PATH}"
+      node --version
+
+      # Put a real `yarn` executable on PATH that calls the vendored Yarn
+      # Berry release with our freshly unpacked node — instead of relying
+      # on a globally installed yarn or corepack shim being present in
+      # this build environment. This has to be a literal executable file,
+      # not a shell function/alias: lage.config.js sets `npmClient:
+      # 'yarn'`, and lage spawns per-workspace build tasks (e.g. for
+      # bin/package-browser's `lage build:browser --to=@actual-app/web`,
+      # which pulls in plugins-service's `build` task as a workspace
+      # dependency) via Node's child_process, which does a plain PATH
+      # lookup for "yarn" — it can't see a bash function defined only in
+      # this script's shell.
+      printf '%s\n' '#!/bin/sh' \
+        "exec \"${NODE_DIST_DIR}/bin/node\" \"${CRAFT_PART_SRC}/.yarn/releases/yarn-4.17.1.cjs\" \"\$@\"" \
+        > "${NODE_DIST_DIR}/bin/yarn"
+      chmod +x "${NODE_DIST_DIR}/bin/yarn"
+
+      cd "${CRAFT_PART_SRC}"
+
+      # Locally-installed workspace binaries (lage, vite, ...) are only put
+      # on PATH automatically when invoked through a `yarn <script>` chain.
+      # bin/package-browser is called directly below, so add them here too.
+      export PATH="${CRAFT_PART_SRC}/node_modules/.bin:${PATH}"
+
+      # ---------------------------------------------------------------
+      # 1b. root package.json's dependenciesMeta re-enables install/build
+      #     scripts (enableScripts: false is the .yarnrc.yml-wide default)
+      #     for exactly 6 packages: argon2, bcrypt, better-sqlite3 (needed
+      #     — sync-server native addons, compiled locally via node-gyp),
+      #     and electron, esbuild, sharp (NOT needed — electron belongs to
+      #     packages/desktop-electron, sharp is a transitive dep of
+      #     packages/mobile-client; neither is built or shipped by this
+      #     snap). electron's and sharp's install scripts fetch prebuilt
+      #     binaries from GitHub releases, which fails in build
+      #     environments that can't reach github.com (see the `source:`
+      #     comment above) — drop just those two from dependenciesMeta so
+      #     yarn never attempts their scripts. esbuild is left alone: vite
+      #     (used by both the web and server builds) needs it, and it
+      #     builds fine locally without any network fetch.
+      # ---------------------------------------------------------------
+      node -e "
+        const fs = require('node:fs');
+        const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+        delete p.dependenciesMeta.electron;
+        delete p.dependenciesMeta.sharp;
+        fs.writeFileSync('package.json', JSON.stringify(p, null, 2) + '\n');
+      "
+
+      # ---------------------------------------------------------------
+      # 2. Full, non-production install.
+      # ---------------------------------------------------------------
+      yarn install
+
+      # ---------------------------------------------------------------
+      # 3. lage's task hasher shells out to `git ls-tree HEAD` during
+      #    initialization even when caching is disabled for a target.
+      #    Seed a throwaway repo, exactly like sync-server.Dockerfile.
+      #
+      #    `git init` is safe on an existing repo (it just reinitialises),
+      #    which matters now that source: is a git clone rather than a
+      #    plain directory copy — the tree may already carry a .git. The
+      #    commit is allowed to fail: on a pristine clone with no local
+      #    modifications there is nothing to commit, and HEAD already
+      #    exists from the clone, so `git ls-tree HEAD` still resolves.
+      #    Without the guard, `set -e` would abort the whole build there.
+      # ---------------------------------------------------------------
+      git -c init.defaultBranch=master init -q
+      git -c user.email=build@snap -c user.name=snap-build add -A
+      git -c user.email=build@snap -c user.name=snap-build commit -qm build || true
+      git rev-parse HEAD >/dev/null 2>&1 || {
+        echo "FATAL: no HEAD after git seed step; lage's hasher will fail" >&2
+        exit 1
+      }
+
+      # ---------------------------------------------------------------
+      # 4. Build the browser UI and the sync server. This is the same
+      #    work as `yarn build:server` (build:browser && workspace build)
+      #    but calls bin/package-browser directly with
+      #    --skip-translations so it never shells out to git-clone
+      #    actualbudget/translations, which would make this build depend
+      #    on network access to a second, unrelated repo.
+      # ---------------------------------------------------------------
+      ./bin/package-browser --skip-translations
+      yarn workspace @actual-app/sync-server build
+
+      # ---------------------------------------------------------------
+      # 5. Prune to production-only node_modules.
+      # ---------------------------------------------------------------
+      yarn workspaces focus @actual-app/sync-server --production
+
+      # ---------------------------------------------------------------
+      # 6. Dereference the @actual-app/web and @actual-app/sync-server
+      #    workspace symlinks. load-config.js resolves the web UI's
+      #    static assets via require.resolve('@actual-app/web/package.json'),
+      #    so @actual-app/web must remain resolvable from node_modules —
+      #    recreate it manually from the built desktop-client artifacts.
+      # ---------------------------------------------------------------
+      rm -rf node_modules/@actual-app/web node_modules/@actual-app/sync-server
+      mkdir -p node_modules/@actual-app/web
+      cp packages/desktop-client/package.json node_modules/@actual-app/web/package.json
+      cp -r packages/desktop-client/build node_modules/@actual-app/web/build
+
+      # ---------------------------------------------------------------
+      # 7. Stage exactly the runtime payload: node_modules/,
+      #    packages/sync-server/package.json and packages/sync-server/build/,
+      #    preserved as siblings (node_modules next to package.json next to
+      #    build/) so relative resolution keeps working at runtime.
+      # ---------------------------------------------------------------
+      mkdir -p "${CRAFT_PART_INSTALL}/bin"
+      cp -r node_modules "${CRAFT_PART_INSTALL}/node_modules"
+      cp packages/sync-server/package.json "${CRAFT_PART_INSTALL}/package.json"
+      cp -r packages/sync-server/build "${CRAFT_PART_INSTALL}/build"
+
+      # ---------------------------------------------------------------
+      # 8. Install the node binary this was built with into the part's
+      #    install tree, since core26's archive nodejs (22.22.1) is not
+      #    being used. Only the executable is needed at runtime (no npm,
+      #    no headers) — better-sqlite3/argon2/bcrypt are already
+      #    compiled native addons at this point.
+      # ---------------------------------------------------------------
+      cp "${NODE_DIST_DIR}/bin/node" "${CRAFT_PART_INSTALL}/bin/node"
+
+      # ---------------------------------------------------------------
+      # 9. Wrapper script: snapd does not set the process CWD to $SNAP,
+      #    so cd there explicitly to preserve the node_modules/package.json/
+      #    build sibling layout the runtime resolution depends on. Also
+      #    runs pending DB migrations idempotently before every start —
+      #    see SNAP_PACKAGING.md for why that's done here instead of only
+      #    in the install hook.
+      # ---------------------------------------------------------------
+      printf '%s\n' \
+        '#!/bin/sh' \
+        'set -e' \
+        'export ACTUAL_DATA_DIR="${ACTUAL_DATA_DIR:-$SNAP_COMMON/data}"' \
+        'mkdir -p "$ACTUAL_DATA_DIR"' \
+        'cd "$SNAP"' \
+        '"$SNAP/bin/node" "$SNAP/build/scripts/run-migrations.js" up' \
+        'exec "$SNAP/bin/node" "$SNAP/build/app.js"' \
+        > "${CRAFT_PART_INSTALL}/bin/run-daemon"
+      chmod +x "${CRAFT_PART_INSTALL}/bin/run-daemon"
