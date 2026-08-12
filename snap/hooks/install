@@ -1,15 +1,9 @@
 #!/bin/bash
 set -e
 
-# app.js never creates its own data directories. Only the
-# create-folders migration does (packages/sync-server/migrations/
-# 1694360000000-create-folders.js), and nothing in app.ts/app.js runs
-# migrations automatically at process start. Create the dataDir here so
-# the very first migration run (done idempotently by bin/run-daemon on
-# every daemon start — see SNAP_PACKAGING.md) has somewhere to create
-# server-files/ and user-files/ under, and so account-db.js's
-# getAccountDb() has a dataDir to open account.sqlite in even before the
-# first successful migration run.
+# app.js never creates its data directories -- only the create-folders migration
+# does, and nothing runs migrations at process start. getAccountDb() needs
+# dataDir to exist before the first migration run.
 mkdir -p "$SNAP_COMMON/data"
 mkdir -p "$SNAP_COMMON/data/server-files"
 mkdir -p "$SNAP_COMMON/data/user-files"
